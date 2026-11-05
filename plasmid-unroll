@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+"""Inspect or normalize one nominated circular contig in an assembly FASTA."""
+
+import argparse
+from dataclasses import asdict, dataclass
+import json
+import os
+from pathlib import Path
+import subprocess
+from tempfile import NamedTemporaryFile, TemporaryDirectory
+
+
+@dataclass(frozen=True)
+class Match:
+    unit_start: int
+    unit_end: int
+    contig_start: int
+    contig_end: int
+    identity_pct: float
+
+    def extract(self, sequence):
+        return sequence[self.contig_start - 1:self.contig_end]
+
+
+def fasta_records(path):
+    header = None
+    sequence_lines = []
+    with path.open() as handle:
+        for line in handle:
+            line = line.rstrip("\r\n")
+            if line.startswith(">"):
+                if header is not None:
+                    yield header, "".join(sequence_lines)
+                header = line[1:]
+                if not header.strip():
+                    raise ValueError(f"Empty FASTA header in {path}")
+                sequence_lines = []
+            elif line.strip():
+                if header is None:
+                    raise ValueError(f"Sequence before FASTA header in {path}")
+                sequence_lines.append(line.strip())
+    if header is not None:
+        yield header, "".join(sequence_lines)
+
+
+def alignment_matches(reference, query):
+    # NUCmer stores FASTA names in a space-delimited delta header.
+    with TemporaryDirectory(prefix="circular-tandem-") as work:
+        directory = Path(work)
+        (directory / "reference.fa").write_text(f">reference\n{reference}\n")
+        (directory / "query.fa").write_text(f">query\n{query}\n")
+        subprocess.run(
+            ["nucmer", "--forward", "--maxmatch", "--nosimplify", "--minmatch", "31",
+             "--mincluster", "100", "--threads", "1", "--prefix", "matches",
+             "reference.fa", "query.fa"],
+            cwd=directory, check=True, stdout=subprocess.DEVNULL,
+        )
+        coords = subprocess.check_output(
+            ["show-coords", "-THrl", "matches.delta"], cwd=directory, text=True
+        )
+    return [
+        Match(*map(int, fields[:4]), float(fields[6]))
+        for fields in (line.split("\t") for line in coords.splitlines())
+    ]
+
+
+def guided_copy(sequence, unit, min_identity, report):
+    matches = alignment_matches(unit, sequence)
+    unit_length = len(unit)
+    tiles = sorted(
+        (
+            hit for hit in matches
+            if hit.identity_pct >= min_identity
+            and (hit.unit_start == 1 or hit.contig_start == 1)
+            and (hit.unit_end == unit_length or hit.contig_end == len(sequence))
+        ),
+        key=lambda hit: hit.contig_start,
+    )
+    report["guide_length_bp"] = unit_length
+    report["tiles"] = [asdict(hit) for hit in tiles]
+    report["status"] = "review_unverified_guide"
+    if (
+        not tiles or tiles[0].contig_start != 1 or tiles[-1].contig_end != len(sequence)
+        or any(left.contig_end + 1 != right.contig_start for left, right in zip(tiles, tiles[1:]))
+    ):
+        return None
+
+    complete = [hit for hit in tiles if hit.unit_start == 1 and hit.unit_end == unit_length]
+    report["complete_copies"] = len(complete)
+    same_length = [
+        hit for hit in complete if hit.contig_end - hit.contig_start + 1 == unit_length
+    ]
+    if len(complete) < 2 or not same_length:
+        return None
+    best_identity = max(hit.identity_pct for hit in same_length)
+    best = [hit for hit in same_length if hit.identity_pct == best_identity]
+    selected = best[0]
+    observed = selected.extract(sequence)
+    if any(hit.extract(sequence) != observed for hit in best[1:]):
+        report["status"] = "review_tied_distinct_copies"
+        return None
+    report.update(status="guided_candidate", unit_bp=len(observed), retained=asdict(selected))
+    return observed
+
+
+def inspect_sequence(sequence, args, report):
+    if set(sequence) - set("ACGT"):
+        report["status"] = "review_ambiguous_bases"
+        return None
+    if args.unit:
+        records = list(fasta_records(args.unit))
+        if len(records) != 1:
+            raise ValueError("--unit must contain exactly one FASTA record")
+        unit = records[0][1].upper()
+        if len(unit) < args.min_unit or set(unit) - set("ACGT"):
+            raise ValueError("--unit must be at least --min-unit bp and contain only A/C/G/T")
+        report.update(guide=str(args.unit), min_identity_pct=args.min_identity)
+        return guided_copy(sequence, unit, args.min_identity, report)
+
+    period = (sequence + sequence).find(sequence, 1, -1)
+    if period >= args.min_unit:
+        report.update(
+            status="exact_candidate", unit_bp=period, complete_copies=len(sequence) // period,
+            retained={"contig_start": 1, "contig_end": period, "identity_pct": 100.0},
+        )
+        return sequence[:period]
+    if period > 0:
+        report.update(status="review_unit_below_minimum", unit_bp=period)
+        return None
+    report["status"] = "no_exact_repeat"
+    if args.self_align:
+        report["min_identity_pct"] = args.min_identity
+        terminal_hits = [
+            hit for hit in alignment_matches(sequence, sequence)
+            if hit.unit_start == 1 and hit.contig_end == len(sequence)
+            and args.min_unit <= hit.contig_start - 1 <= len(sequence) / 2
+            and hit.identity_pct >= args.min_identity
+        ]
+        report["status"] = "no_terminal_repeat"
+        if terminal_hits:
+            first = min(terminal_hits, key=lambda hit: hit.contig_start)
+            report.update(
+                status="review_terminal_repeat", start_shift_bp=first.contig_start - 1,
+                end_shift_bp=first.contig_end - first.unit_end, self_match=asdict(first),
+            )
+    return None
+
+
+def write_assembly(path, records, selected_index, replacement_header, replacement_sequence):
+    # Publish a complete file atomically and fail if the output path already exists.
+    with NamedTemporaryFile(mode="w", dir=path.parent, prefix=".circular-tandem-") as handle:
+        for index, (header, sequence) in enumerate(records):
+            if index == selected_index:
+                header, sequence = replacement_header, replacement_sequence
+            handle.write(f">{header}\n")
+            for offset in range(0, len(sequence), 80):
+                handle.write(sequence[offset:offset + 80] + "\n")
+        handle.flush()
+        os.link(handle.name, path)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("assembly", type=Path, help="Input assembly FASTA")
+    parser.add_argument("contig", help="ID of the contig already identified as circular")
+    detection = parser.add_mutually_exclusive_group()
+    detection.add_argument("--self-align", action="store_true", help="Screen for near repeats with NUCmer")
+    detection.add_argument("--unit", type=Path, help="FASTA with a supported single-copy guide on the same strand")
+    parser.add_argument("--min-unit", type=int, default=500, help="Minimum repeat unit length in bp")
+    parser.add_argument("--min-identity", type=float, default=98.0, help="Minimum NUCmer identity in percent")
+    parser.add_argument("--output", type=Path, help="Write a new assembly FASTA for a supported candidate")
+    parser.add_argument("--output-id", help="ID for the single-copy record (default: input ID + .monomer)")
+    args = parser.parse_args()
+    if args.min_unit < 1 or not 0 < args.min_identity <= 100:
+        parser.error("--min-unit must be positive and --min-identity must be in (0, 100]")
+    if args.output_id is not None and (len(args.output_id.split()) != 1 or args.output_id.strip() != args.output_id):
+        parser.error("--output-id must be one FASTA identifier")
+
+    try:
+        records = list(fasta_records(args.assembly))
+        ids = [header.split()[0] for header, _ in records]
+        if ids.count(args.contig) != 1:
+            raise ValueError(f"Expected exactly one FASTA record for {args.contig!r}")
+        index = ids.index(args.contig)
+        sequence = records[index][1].upper()
+        if not sequence:
+            raise ValueError(f"Empty sequence for {args.contig!r}")
+        report = {"contig": args.contig, "length_bp": len(sequence)}
+        replacement = inspect_sequence(sequence, args, report)
+        if args.output and replacement:
+            output_id = args.output_id or f"{args.contig}.monomer"
+            if output_id in ids[:index] + ids[index + 1:]:
+                raise ValueError(f"Output ID {output_id!r} conflicts with another record")
+            header = f"{output_id} circular=true length={len(replacement)} source={args.contig}"
+            write_assembly(args.output, records, index, header, replacement)
+            report.update(output=str(args.output), output_id=output_id)
+        print(json.dumps(report, indent=2))
+        return 1 if args.output and replacement is None else 0
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+        parser.exit(2, f"{parser.prog}: {error}\n")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
