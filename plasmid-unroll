@@ -10,6 +10,9 @@ import subprocess
 from tempfile import NamedTemporaryFile, TemporaryDirectory
 
 
+MIN_CLUSTER_BP = 100
+
+
 @dataclass(frozen=True)
 class Match:
     unit_start: int
@@ -51,7 +54,7 @@ def alignment_matches(reference, query):
         (directory / "query.fa").write_text(f">query\n{query}\n")
         subprocess.run(
             ["nucmer", "--forward", "--maxmatch", "--nosimplify", "--minmatch", "31",
-             "--mincluster", "100", "--threads", "1", "--prefix", "matches",
+             "--mincluster", str(MIN_CLUSTER_BP), "--threads", "1", "--prefix", "matches",
              "reference.fa", "query.fa"],
             cwd=directory, check=True, stdout=subprocess.DEVNULL,
         )
@@ -64,7 +67,29 @@ def alignment_matches(reference, query):
     ]
 
 
-def guided_copy(sequence, unit, min_identity, report):
+def exact_partial_match(sequence, min_unit):
+    max_overlap = min((len(sequence) - 1) // 2, len(sequence) - min_unit)
+    if max_overlap < MIN_CLUSTER_BP:
+        return None
+
+    # The separator limits the longest prefix-suffix match to the two ends.
+    ends = sequence[:max_overlap] + "#" + sequence[-max_overlap:]
+    prefix_lengths = [0] * len(ends)
+    matched = 0
+    for index in range(1, len(ends)):
+        while matched and ends[index] != ends[matched]:
+            matched = prefix_lengths[matched - 1]
+        if ends[index] == ends[matched]:
+            matched += 1
+        prefix_lengths[index] = matched
+    if matched >= MIN_CLUSTER_BP:
+        return Match(1, matched, len(sequence) - matched + 1, len(sequence), 100.0)
+    return None
+
+
+def guided_copy(
+    sequence, unit, min_identity, report, *, allow_partial=False, max_length_diff_pct=0.0, min_unit=1
+):
     matches = alignment_matches(unit, sequence)
     unit_length = len(unit)
     tiles = sorted(
@@ -76,7 +101,7 @@ def guided_copy(sequence, unit, min_identity, report):
         ),
         key=lambda hit: hit.contig_start,
     )
-    report["guide_length_bp"] = unit_length
+    report.update(guide_length_bp=unit_length, max_length_diff_pct=max_length_diff_pct)
     report["tiles"] = [asdict(hit) for hit in tiles]
     report["status"] = "review_unverified_guide"
     if (
@@ -86,20 +111,39 @@ def guided_copy(sequence, unit, min_identity, report):
         return None
 
     complete = [hit for hit in tiles if hit.unit_start == 1 and hit.unit_end == unit_length]
-    report["complete_copies"] = len(complete)
-    same_length = [
-        hit for hit in complete if hit.contig_end - hit.contig_start + 1 == unit_length
-    ]
-    if len(complete) < 2 or not same_length:
+    copy_lengths = [(hit, hit.contig_end - hit.contig_start + 1) for hit in complete]
+    report.update(complete_copies=len(complete), complete_copy_lengths_bp=[length for _, length in copy_lengths])
+    partial = (
+        len(complete) == 1 and len(tiles) > 1
+        and unit_length < len(sequence) < 2 * unit_length
+    )
+    if partial:
+        report.update(
+            status="review_partial_repeat", unit_bp=unit_length,
+            estimated_copies=round(len(sequence) / unit_length, 3),
+        )
+        if not allow_partial:
+            return None
+    elif len(complete) < 2:
         return None
-    best_identity = max(hit.identity_pct for hit in same_length)
-    best = [hit for hit in same_length if hit.identity_pct == best_identity]
+
+    eligible = [
+        hit for hit, length in copy_lengths
+        if length >= min_unit and 100 * abs(length - unit_length) / unit_length <= max_length_diff_pct
+    ]
+    if not eligible:
+        return None
+    best_identity = max(hit.identity_pct for hit in eligible)
+    best = [hit for hit in eligible if hit.identity_pct == best_identity]
     selected = best[0]
     observed = selected.extract(sequence)
     if any(hit.extract(sequence) != observed for hit in best[1:]):
         report["status"] = "review_tied_distinct_copies"
         return None
-    report.update(status="guided_candidate", unit_bp=len(observed), retained=asdict(selected))
+    report.update(
+        status="guided_partial_candidate" if partial else "guided_candidate",
+        unit_bp=len(observed), retained=asdict(selected), retained_length_delta_bp=len(observed) - unit_length,
+    )
     return observed
 
 
@@ -115,7 +159,10 @@ def inspect_sequence(sequence, args, report):
         if len(unit) < args.min_unit or set(unit) - set("ACGT"):
             raise ValueError("--unit must be at least --min-unit bp and contain only A/C/G/T")
         report.update(guide=str(args.unit), min_identity_pct=args.min_identity)
-        return guided_copy(sequence, unit, args.min_identity, report)
+        return guided_copy(
+            sequence, unit, args.min_identity, report, allow_partial=args.allow_partial,
+            max_length_diff_pct=args.max_length_diff_pct or 0.0, min_unit=args.min_unit,
+        )
 
     period = (sequence + sequence).find(sequence, 1, -1)
     if period >= args.min_unit:
@@ -133,14 +180,19 @@ def inspect_sequence(sequence, args, report):
         terminal_hits = [
             hit for hit in alignment_matches(sequence, sequence)
             if hit.unit_start == 1 and hit.contig_end == len(sequence)
-            and args.min_unit <= hit.contig_start - 1 <= len(sequence) / 2
+            and hit.contig_start - 1 >= args.min_unit
             and hit.identity_pct >= args.min_identity
         ]
         report["status"] = "no_terminal_repeat"
-        if terminal_hits:
-            first = min(terminal_hits, key=lambda hit: hit.contig_start)
+        first = min(terminal_hits, key=lambda hit: hit.contig_start, default=None)
+        if first is None:
+            first = exact_partial_match(sequence, args.min_unit)
+        if first is not None:
+            start_shift = first.contig_start - 1
+            partial = 2 * start_shift > len(sequence)
             report.update(
-                status="review_terminal_repeat", start_shift_bp=first.contig_start - 1,
+                status="review_partial_repeat" if partial else "review_terminal_repeat",
+                estimated_copies=round(len(sequence) / start_shift, 3), start_shift_bp=start_shift,
                 end_shift_bp=first.contig_end - first.unit_end, self_match=asdict(first),
             )
     return None
@@ -166,11 +218,20 @@ def main():
     detection = parser.add_mutually_exclusive_group()
     detection.add_argument("--self-align", action="store_true", help="Screen for near repeats with NUCmer")
     detection.add_argument("--unit", type=Path, help="FASTA with a supported single-copy guide on the same strand")
+    parser.add_argument("--allow-partial", action="store_true", help="Allow collapse of one full copy plus a partial repeat (requires --unit)")
     parser.add_argument("--min-unit", type=int, default=500, help="Minimum repeat unit length in bp")
     parser.add_argument("--min-identity", type=float, default=98.0, help="Minimum NUCmer identity in percent")
+    parser.add_argument(
+        "--max-length-diff-pct", type=float,
+        help="Maximum length difference between the retained copy and --unit, as a percent of guide length (default: 0)",
+    )
     parser.add_argument("--output", type=Path, help="Write a new assembly FASTA for a supported candidate")
     parser.add_argument("--output-id", help="ID for the single-copy record (default: input ID + .monomer)")
     args = parser.parse_args()
+    if args.allow_partial and args.unit is None:
+        parser.error("--allow-partial requires --unit")
+    if args.max_length_diff_pct is not None and (args.unit is None or not 0 <= args.max_length_diff_pct <= 100):
+        parser.error("--max-length-diff-pct requires --unit and must be in [0, 100]")
     if args.min_unit < 1 or not 0 < args.min_identity <= 100:
         parser.error("--min-unit must be positive and --min-identity must be in (0, 100]")
     if args.output_id is not None and (len(args.output_id.split()) != 1 or args.output_id.strip() != args.output_id):
